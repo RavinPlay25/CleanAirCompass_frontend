@@ -79,16 +79,17 @@ function norm(param: string, value: number, unit: string) {
 
 // ---------- data sources ----------
 
-// OpenAQ: may fail due to DNS/firewall or sparse coverage
+// OpenAQ (kept here if you want to turn it back on later)
+/*
 async function fetchOpenAQ(lat: number, lng: number, radius: number) {
   const url = `https://api.openaq.org/v2/measurements?coordinates=${lat},${lng}&radius=${radius}&limit=400&order_by=datetime&sort=desc&parameters=pm25,o3,no2,co`;
   const r = await fetch(url, { next: { revalidate: 30 } });
   if (!r.ok) throw new Error(`OpenAQ HTTP ${r.status}`);
   return r.json() as Promise<any>;
 }
+*/
 
-// Open-Meteo fallback: no key, global coverage (returns µg/m³ for PM2.5,
-// µg/m³ for NO2, µg/m³ for O3 (approx), mg/m³ for CO -> we’ll normalize)
+// Open-Meteo fallback (no key)
 async function fetchOpenMeteo(lat: number, lng: number) {
   const url = `https://air-quality-api.open-meteo.com/v1/air-quality?latitude=${lat}&longitude=${lng}&hourly=pm2_5,carbon_monoxide,nitrogen_dioxide,ozone&timezone=UTC`;
   const r = await fetch(url, { next: { revalidate: 30 } });
@@ -98,7 +99,7 @@ async function fetchOpenMeteo(lat: number, lng: number) {
 
 // Your Python model
 async function modelCategory(args: {co?:number;o3?:number;no2?:number;pm25?:number;lat:number;lng:number}) {
-  const base = process.env.PY_BACKEND_URL; // from .env.local
+  const base = process.env.PY_BACKEND_URL;
   if (!base) return undefined;
   const {co=0,o3=0,no2=0,pm25=0,lat,lng} = args;
   const q = new URLSearchParams({
@@ -112,6 +113,19 @@ async function modelCategory(args: {co?:number;o3?:number;no2?:number;pm25?:numb
     return (j?.category as string) || undefined;
   } catch {
     return undefined;
+  }
+}
+
+// NEW: nearest dataset city (from Python microservice)
+async function nearestCity(lat: number, lng: number) {
+  const base = process.env.PY_BACKEND_URL;
+  if (!base) return null;
+  try {
+    const r = await fetch(`${base}/nearest-city?lat=${lat}&lng=${lng}`, { cache: "no-store" });
+    if (!r.ok) return null;
+    return await r.json(); // { city, country, aqi_value, aqi_category, distance_km }
+  } catch {
+    return null;
   }
 }
 
@@ -132,46 +146,44 @@ export async function GET(req: Request) {
   let aqi_no2: number | undefined;
   let aqi_co: number | undefined;
 
-// ---------- Fallback: Open-Meteo (model/forecast) ----------
-if (source !== "openaq") {
-  try {
-    const m = await fetchOpenMeteo(lat, lng);
+  // ---------- Fallback: Open-Meteo (model/forecast) ----------
+  if (source !== "openaq") {
+    try {
+      const m = await fetchOpenMeteo(lat, lng);
 
-    // helper: latest non-null/number value within last N hours
-    const latestNumber = (arr: any[], lookback = 48): number | undefined => {
-      if (!Array.isArray(arr) || arr.length === 0) return undefined;
-      const start = Math.max(0, arr.length - lookback);
-      for (let i = arr.length - 1; i >= start; i--) {
-        const v = arr[i];
-        if (typeof v === "number" && Number.isFinite(v)) return v;
-      }
-      return undefined;
-    };
+      // helper: latest non-null/number value within last N hours
+      const latestNumber = (arr: any[], lookback = 48): number | undefined => {
+        if (!Array.isArray(arr) || arr.length === 0) return undefined;
+        const start = Math.max(0, arr.length - lookback);
+        for (let i = arr.length - 1; i >= start; i--) {
+          const v = arr[i];
+          if (typeof v === "number" && Number.isFinite(v)) return v;
+        }
+        return undefined;
+      };
 
-    // units: pm2_5 µg/m³; nitrogen_dioxide µg/m³; ozone µg/m³; carbon_monoxide mg/m³
-    const pm25_ug = latestNumber(m?.hourly?.pm2_5);
-    const no2_ug  = latestNumber(m?.hourly?.nitrogen_dioxide);
-    const o3_ug   = latestNumber(m?.hourly?.ozone);
-    const co_mg   = latestNumber(m?.hourly?.carbon_monoxide);
+      // units: pm2_5 µg/m³; nitrogen_dioxide µg/m³; ozone µg/m³; carbon_monoxide mg/m³
+      const pm25_ug = latestNumber(m?.hourly?.pm2_5);
+      const no2_ug  = latestNumber(m?.hourly?.nitrogen_dioxide);
+      const o3_ug   = latestNumber(m?.hourly?.ozone);
+      const co_mg   = latestNumber(m?.hourly?.carbon_monoxide);
 
-    // normalize to the model’s/US AQI expectations
-    const pm25_u = pm25_ug; // already µg/m³
-    const no2_ppb = no2_ug !== undefined ? (no2_ug * R) / 46.0055 : undefined;
-    const o3_ppb  = o3_ug  !== undefined ? (o3_ug  * R) / 48      : undefined;
-    const co_ppm  = co_mg  !== undefined ? (co_mg  * R) / 28.01   : undefined;
+      // normalize to the model’s/US AQI expectations
+      const pm25_u = pm25_ug; // already µg/m³
+      const no2_ppb = no2_ug !== undefined ? (no2_ug * R) / 46.0055 : undefined;
+      const o3_ppb  = o3_ug  !== undefined ? (o3_ug  * R) / 48      : undefined;
+      const co_ppm  = co_mg  !== undefined ? (co_mg  * R) / 28.01   : undefined;
 
-    aqi_pm25 = pm25_u !== undefined ? Math.round(linearAQI(pm25_u, PM25) ?? 0) : undefined;
-    aqi_o3   = o3_ppb  !== undefined ? Math.round(linearAQI(o3_ppb,  O3_8H_PPb) ?? 0) : undefined;
-    aqi_no2  = no2_ppb !== undefined ? Math.round(linearAQI(no2_ppb, NO2_1H_PPb) ?? 0) : undefined;
-    aqi_co   = co_ppm  !== undefined ? Math.round(linearAQI(co_ppm,  CO_8H_PPM) ?? 0) : undefined;
+      aqi_pm25 = pm25_u !== undefined ? Math.round(linearAQI(pm25_u, PM25) ?? 0) : undefined;
+      aqi_o3   = o3_ppb  !== undefined ? Math.round(linearAQI(o3_ppb,  O3_8H_PPb) ?? 0) : undefined;
+      aqi_no2  = no2_ppb !== undefined ? Math.round(linearAQI(no2_ppb, NO2_1H_PPb) ?? 0) : undefined;
+      aqi_co   = co_ppm  !== undefined ? Math.round(linearAQI(co_ppm,  CO_8H_PPM) ?? 0) : undefined;
 
-    // mark fallback source
-    source = "openmeteo";
-  } catch (e) {
-    // ignore; will return Unknown if still nothing
+      source = "openmeteo";
+    } catch (e) {
+      // ignore; will return Unknown if still nothing
+    }
   }
-}
-
 
   const subs = [aqi_pm25, aqi_o3, aqi_no2, aqi_co].filter((x) => x !== undefined) as number[];
   const overall = subs.length ? Math.max(...subs) : undefined;
@@ -190,6 +202,9 @@ if (source !== "openaq") {
     "Unknown":"Live data unavailable nearby. Try a larger city.",
   }[cat] ?? "Check local guidance.";
 
+  // NEW: nearest dataset city + distance (served by FastAPI)
+  const nearest = await nearestCity(lat, lng);
+
   return NextResponse.json({
     source,
     radiusUsed: source === "openaq" ? radius : null,
@@ -197,6 +212,7 @@ if (source !== "openaq") {
     overall,
     category: cat,
     tip,
+    nearestCity: nearest,            // <-- added
     debug: { openaqError },
   });
 }
