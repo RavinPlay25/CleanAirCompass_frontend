@@ -78,18 +78,13 @@ function norm(param: string, value: number, unit: string) {
 }
 
 // ---------- data sources ----------
-
-// OpenAQ (kept here if you want to turn it back on later)
-/*
 async function fetchOpenAQ(lat: number, lng: number, radius: number) {
   const url = `https://api.openaq.org/v2/measurements?coordinates=${lat},${lng}&radius=${radius}&limit=400&order_by=datetime&sort=desc&parameters=pm25,o3,no2,co`;
   const r = await fetch(url, { next: { revalidate: 30 } });
   if (!r.ok) throw new Error(`OpenAQ HTTP ${r.status}`);
   return r.json() as Promise<any>;
 }
-*/
 
-// Open-Meteo fallback (no key)
 async function fetchOpenMeteo(lat: number, lng: number) {
   const url = `https://air-quality-api.open-meteo.com/v1/air-quality?latitude=${lat}&longitude=${lng}&hourly=pm2_5,carbon_monoxide,nitrogen_dioxide,ozone&timezone=UTC`;
   const r = await fetch(url, { next: { revalidate: 30 } });
@@ -97,7 +92,7 @@ async function fetchOpenMeteo(lat: number, lng: number) {
   return r.json() as Promise<any>;
 }
 
-// Your Python model
+// Python model
 async function modelCategory(args: {co?:number;o3?:number;no2?:number;pm25?:number;lat:number;lng:number}) {
   const base = process.env.PY_BACKEND_URL;
   if (!base) return undefined;
@@ -116,24 +111,11 @@ async function modelCategory(args: {co?:number;o3?:number;no2?:number;pm25?:numb
   }
 }
 
-// NEW: nearest dataset city (from Python microservice)
-async function nearestCity(lat: number, lng: number) {
-  const base = process.env.PY_BACKEND_URL;
-  if (!base) return null;
-  try {
-    const r = await fetch(`${base}/nearest-city?lat=${lat}&lng=${lng}`, { cache: "no-store" });
-    if (!r.ok) return null;
-    return await r.json(); // { city, country, aqi_value, aqi_category, distance_km }
-  } catch {
-    return null;
-  }
-}
-
 export async function GET(req: Request) {
   const { searchParams } = new URL(req.url);
   const lat = Number(searchParams.get("lat"));
   const lng = Number(searchParams.get("lng"));
-  let radius = Number(searchParams.get("radius") ?? 100_000); // 100 km default
+  const radius = Number(searchParams.get("radius") ?? 100_000); // 100 km default
 
   if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
     return NextResponse.json({ error: "lat/lng required" }, { status: 400 });
@@ -146,13 +128,41 @@ export async function GET(req: Request) {
   let aqi_no2: number | undefined;
   let aqi_co: number | undefined;
 
-  // ---------- Fallback: Open-Meteo (model/forecast) ----------
-  if (source !== "openaq") {
+  // ---------- Try OpenAQ first (optional; OK if it fails) ----------
+  try {
+    const data = await fetchOpenAQ(lat, lng, radius);
+    const seen = new Map<string, { value: number; unit: string }>();
+    for (const item of (data?.results as any[] | undefined) ?? []) {
+      const p = String(item?.parameter ?? "").toLowerCase();
+      if (!["pm25", "o3", "no2", "co"].includes(p)) continue;
+      const val = Number(item?.value);
+      const unit = String(item?.unit ?? "");
+      if (!Number.isFinite(val)) continue;
+      if (!seen.has(p)) seen.set(p, { value: val, unit });
+    }
+    const pm25_u = seen.get("pm25") ? norm("pm25", seen.get("pm25")!.value, seen.get("pm25")!.unit) : undefined;
+    const o3_ppb  = seen.get("o3")  ? norm("o3",  seen.get("o3")!.value,  seen.get("o3")!.unit) : undefined;
+    const no2_ppb = seen.get("no2") ? norm("no2", seen.get("no2")!.value, seen.get("no2")!.unit) : undefined;
+    const co_ppm  = seen.get("co")  ? norm("co",  seen.get("co")!.value,  seen.get("co")!.unit) : undefined;
+
+    aqi_pm25 = pm25_u !== undefined ? Math.round(linearAQI(pm25_u, PM25) ?? 0) : undefined;
+    aqi_o3   = o3_ppb  !== undefined ? Math.round(linearAQI(o3_ppb,  O3_8H_PPb) ?? 0) : undefined;
+    aqi_no2  = no2_ppb !== undefined ? Math.round(linearAQI(no2_ppb, NO2_1H_PPb) ?? 0) : undefined;
+    aqi_co   = co_ppm  !== undefined ? Math.round(linearAQI(co_ppm,  CO_8H_PPM) ?? 0) : undefined;
+
+    if ([aqi_pm25, aqi_o3, aqi_no2, aqi_co].some(v => v !== undefined)) {
+      source = "openaq";
+    }
+  } catch (e) {
+    openaqError = (e as Error).message;
+  }
+
+  // ---------- Fallback: Open-Meteo (if we still have no sub-indices) ----------
+  if (![aqi_pm25, aqi_o3, aqi_no2, aqi_co].some(v => v !== undefined)) {
     try {
       const m = await fetchOpenMeteo(lat, lng);
 
-      // helper: latest non-null/number value within last N hours
-      const latestNumber = (arr: any[], lookback = 48): number | undefined => {
+      const latestNumber = (arr: unknown[], lookback = 48): number | undefined => {
         if (!Array.isArray(arr) || arr.length === 0) return undefined;
         const start = Math.max(0, arr.length - lookback);
         for (let i = arr.length - 1; i >= start; i--) {
@@ -163,12 +173,11 @@ export async function GET(req: Request) {
       };
 
       // units: pm2_5 µg/m³; nitrogen_dioxide µg/m³; ozone µg/m³; carbon_monoxide mg/m³
-      const pm25_ug = latestNumber(m?.hourly?.pm2_5);
-      const no2_ug  = latestNumber(m?.hourly?.nitrogen_dioxide);
-      const o3_ug   = latestNumber(m?.hourly?.ozone);
-      const co_mg   = latestNumber(m?.hourly?.carbon_monoxide);
+      const pm25_ug = latestNumber(m?.hourly?.pm2_5 ?? []);
+      const no2_ug  = latestNumber(m?.hourly?.nitrogen_dioxide ?? []);
+      const o3_ug   = latestNumber(m?.hourly?.ozone ?? []);
+      const co_mg   = latestNumber(m?.hourly?.carbon_monoxide ?? []);
 
-      // normalize to the model’s/US AQI expectations
       const pm25_u = pm25_ug; // already µg/m³
       const no2_ppb = no2_ug !== undefined ? (no2_ug * R) / 46.0055 : undefined;
       const o3_ppb  = o3_ug  !== undefined ? (o3_ug  * R) / 48      : undefined;
@@ -180,15 +189,14 @@ export async function GET(req: Request) {
       aqi_co   = co_ppm  !== undefined ? Math.round(linearAQI(co_ppm,  CO_8H_PPM) ?? 0) : undefined;
 
       source = "openmeteo";
-    } catch (e) {
-      // ignore; will return Unknown if still nothing
+    } catch {
+      // leave as none
     }
   }
 
   const subs = [aqi_pm25, aqi_o3, aqi_no2, aqi_co].filter((x) => x !== undefined) as number[];
   const overall = subs.length ? Math.max(...subs) : undefined;
 
-  // Prefer ML category; fallback to deterministic
   let cat = await modelCategory({ co: aqi_co, o3: aqi_o3, no2: aqi_no2, pm25: aqi_pm25, lat, lng });
   if (!cat) cat = toCategory(overall);
 
@@ -202,9 +210,6 @@ export async function GET(req: Request) {
     "Unknown":"Live data unavailable nearby. Try a larger city.",
   }[cat] ?? "Check local guidance.";
 
-  // NEW: nearest dataset city + distance (served by FastAPI)
-  const nearest = await nearestCity(lat, lng);
-
   return NextResponse.json({
     source,
     radiusUsed: source === "openaq" ? radius : null,
@@ -212,7 +217,6 @@ export async function GET(req: Request) {
     overall,
     category: cat,
     tip,
-    nearestCity: nearest,            // <-- added
     debug: { openaqError },
   });
 }
